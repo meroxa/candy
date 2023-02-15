@@ -7,12 +7,9 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"log"
+	"strings"
 	"sync"
 	"time"
-
-	"github.com/smallstep/certificates/cas"
-	"github.com/smallstep/certificates/scep"
-	"go.step.sm/linkedca"
 
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/authority/admin"
@@ -20,38 +17,47 @@ import (
 	"github.com/smallstep/certificates/authority/administrator"
 	"github.com/smallstep/certificates/authority/config"
 	"github.com/smallstep/certificates/authority/provisioner"
+	"github.com/smallstep/certificates/cas"
 	casapi "github.com/smallstep/certificates/cas/apiv1"
 	"github.com/smallstep/certificates/db"
 	"github.com/smallstep/certificates/kms"
 	kmsapi "github.com/smallstep/certificates/kms/apiv1"
 	"github.com/smallstep/certificates/kms/sshagentkms"
+	"github.com/smallstep/certificates/scep"
 	"github.com/smallstep/certificates/templates"
 	"github.com/smallstep/nosql"
 	"go.step.sm/crypto/pemutil"
+	"go.step.sm/linkedca"
 	"golang.org/x/crypto/ssh"
 )
 
 // Authority implements the Certificate Authority internal interface.
 type Authority struct {
-	config       *config.Config
-	keyManager   kms.KeyManager
-	provisioners *provisioner.Collection
-	admins       *administrator.Collection
-	db           db.AuthDB
-	adminDB      admin.DB
-	templates    *templates.Templates
+	config        *config.Config
+	keyManager    kms.KeyManager
+	provisioners  *provisioner.Collection
+	admins        *administrator.Collection
+	db            db.AuthDB
+	adminDB       admin.DB
+	templates     *templates.Templates
+	linkedCAToken string
 
 	// X509 CA
+	password           []byte
+	issuerPassword     []byte
 	x509CAService      cas.CertificateAuthorityService
 	rootX509Certs      []*x509.Certificate
 	rootX509CertPool   *x509.CertPool
 	federatedX509Certs []*x509.Certificate
 	certificates       *sync.Map
+	x509Enforcers      []provisioner.CertificateEnforcer
 
 	// SCEP CA
 	scepService *scep.Service
 
 	// SSH CA
+	sshHostPassword         []byte
+	sshUserPassword         []byte
 	sshCAUserCertSignKey    ssh.Signer
 	sshCAHostCertSignKey    ssh.Signer
 	sshCAUserCerts          []ssh.PublicKey
@@ -64,23 +70,33 @@ type Authority struct {
 	startTime time.Time
 
 	// Custom functions
-	sshBastionFunc   func(ctx context.Context, user, hostname string) (*config.Bastion, error)
-	sshCheckHostFunc func(ctx context.Context, principal string, tok string, roots []*x509.Certificate) (bool, error)
-	sshGetHostsFunc  func(ctx context.Context, cert *x509.Certificate) ([]config.Host, error)
-	getIdentityFunc  provisioner.GetIdentityFunc
+	sshBastionFunc        func(ctx context.Context, user, hostname string) (*config.Bastion, error)
+	sshCheckHostFunc      func(ctx context.Context, principal string, tok string, roots []*x509.Certificate) (bool, error)
+	sshGetHostsFunc       func(ctx context.Context, cert *x509.Certificate) ([]config.Host, error)
+	getIdentityFunc       provisioner.GetIdentityFunc
+	authorizeRenewFunc    provisioner.AuthorizeRenewFunc
+	authorizeSSHRenewFunc provisioner.AuthorizeSSHRenewFunc
 
 	adminMutex sync.RWMutex
 }
 
+type Info struct {
+	StartTime          time.Time
+	RootX509Certs      []*x509.Certificate
+	SSHCAUserPublicKey []byte
+	SSHCAHostPublicKey []byte
+	DNSNames           []string
+}
+
 // New creates and initiates a new Authority type.
-func New(config *config.Config, opts ...Option) (*Authority, error) {
-	err := config.Validate()
+func New(cfg *config.Config, opts ...Option) (*Authority, error) {
+	err := cfg.Validate()
 	if err != nil {
 		return nil, err
 	}
 
 	var a = &Authority{
-		config:       config,
+		config:       cfg,
 		certificates: new(sync.Map),
 	}
 
@@ -169,7 +185,7 @@ func (a *Authority) reloadAdminResources(ctx context.Context) error {
 	// Create provisioner collection.
 	provClxn := provisioner.NewCollection(provisionerConfig.Audiences)
 	for _, p := range provList {
-		if err := p.Init(*provisionerConfig); err != nil {
+		if err := p.Init(provisionerConfig); err != nil {
 			return err
 		}
 		if err := provClxn.Store(p); err != nil {
@@ -205,6 +221,26 @@ func (a *Authority) init() error {
 
 	var err error
 
+	// Set password if they are not set.
+	var configPassword []byte
+	if a.config.Password != "" {
+		configPassword = []byte(a.config.Password)
+	}
+	if configPassword != nil && a.password == nil {
+		a.password = configPassword
+	}
+	if a.sshHostPassword == nil {
+		a.sshHostPassword = a.password
+	}
+	if a.sshUserPassword == nil {
+		a.sshUserPassword = a.password
+	}
+
+	// Automatically enable admin for all linked cas.
+	if a.linkedCAToken != "" {
+		a.config.AuthorityConfig.EnableAdmin = true
+	}
+
 	// Initialize step-ca Database if it's not already initialized with WithDB.
 	// If a.config.DB is nil then a simple, barebones in memory DB will be used.
 	if a.db == nil {
@@ -225,11 +261,47 @@ func (a *Authority) init() error {
 		}
 	}
 
+	// Initialize linkedca client if necessary. On a linked RA, the issuer
+	// configuration might come from majordomo.
+	var linkedcaClient *linkedCaClient
+	if a.config.AuthorityConfig.EnableAdmin && a.linkedCAToken != "" && a.adminDB == nil {
+		linkedcaClient, err = newLinkedCAClient(a.linkedCAToken)
+		if err != nil {
+			return err
+		}
+		// If authorityId is configured make sure it matches the one in the token
+		if id := a.config.AuthorityConfig.AuthorityID; id != "" && !strings.EqualFold(id, linkedcaClient.authorityID) {
+			return errors.New("error initializing linkedca: token authority and configured authority do not match")
+		}
+		linkedcaClient.Run()
+	}
+
 	// Initialize the X.509 CA Service if it has not been set in the options.
 	if a.x509CAService == nil {
 		var options casapi.Options
 		if a.config.AuthorityConfig.Options != nil {
 			options = *a.config.AuthorityConfig.Options
+		}
+
+		// Configure linked RA
+		if linkedcaClient != nil && options.CertificateAuthority == "" {
+			conf, err := linkedcaClient.GetConfiguration(context.Background())
+			if err != nil {
+				return err
+			}
+			if conf.RaConfig != nil {
+				options.CertificateAuthority = conf.RaConfig.CaUrl
+				options.CertificateAuthorityFingerprint = conf.RaConfig.Fingerprint
+				options.CertificateIssuer = &casapi.CertificateIssuer{
+					Type:        conf.RaConfig.Provisioner.Type.String(),
+					Provisioner: conf.RaConfig.Provisioner.Name,
+				}
+			}
+		}
+
+		// Set the issuer password if passed in the flags.
+		if options.CertificateIssuer != nil && a.issuerPassword != nil {
+			options.CertificateIssuer.Password = string(a.issuerPassword)
 		}
 
 		// Read intermediate and create X509 signer for default CAS.
@@ -240,7 +312,7 @@ func (a *Authority) init() error {
 			}
 			options.Signer, err = a.keyManager.CreateSigner(&kmsapi.CreateSignerRequest{
 				SigningKey: a.config.IntermediateKey,
-				Password:   []byte(a.config.Password),
+				Password:   []byte(a.password),
 			})
 			if err != nil {
 				return err
@@ -261,8 +333,6 @@ func (a *Authority) init() error {
 				return err
 			}
 			a.rootX509Certs = append(a.rootX509Certs, resp.RootCertificate)
-			sum := sha256.Sum256(resp.RootCertificate.Raw)
-			log.Printf("Using root fingerprint '%s'", hex.EncodeToString(sum[:]))
 		}
 	}
 
@@ -309,7 +379,7 @@ func (a *Authority) init() error {
 		if a.config.SSH.HostKey != "" {
 			signer, err := a.keyManager.CreateSigner(&kmsapi.CreateSignerRequest{
 				SigningKey: a.config.SSH.HostKey,
-				Password:   []byte(a.config.Password),
+				Password:   []byte(a.sshHostPassword),
 			})
 			if err != nil {
 				return err
@@ -335,7 +405,7 @@ func (a *Authority) init() error {
 		if a.config.SSH.UserKey != "" {
 			signer, err := a.keyManager.CreateSigner(&kmsapi.CreateSignerRequest{
 				SigningKey: a.config.SSH.UserKey,
-				Password:   []byte(a.config.Password),
+				Password:   []byte(a.sshUserPassword),
 			})
 			if err != nil {
 				return err
@@ -359,40 +429,45 @@ func (a *Authority) init() error {
 			a.sshCAUserFederatedCerts = append(a.sshCAUserFederatedCerts, a.sshCAUserCertSignKey.PublicKey())
 		}
 
-		// Append other public keys
+		// Append other public keys and add them to the template variables.
 		for _, key := range a.config.SSH.Keys {
+			publicKey := key.PublicKey()
 			switch key.Type {
 			case provisioner.SSHHostCert:
 				if key.Federated {
-					a.sshCAHostFederatedCerts = append(a.sshCAHostFederatedCerts, key.PublicKey())
+					a.sshCAHostFederatedCerts = append(a.sshCAHostFederatedCerts, publicKey)
 				} else {
-					a.sshCAHostCerts = append(a.sshCAHostCerts, key.PublicKey())
+					a.sshCAHostCerts = append(a.sshCAHostCerts, publicKey)
 				}
 			case provisioner.SSHUserCert:
 				if key.Federated {
-					a.sshCAUserFederatedCerts = append(a.sshCAUserFederatedCerts, key.PublicKey())
+					a.sshCAUserFederatedCerts = append(a.sshCAUserFederatedCerts, publicKey)
 				} else {
-					a.sshCAUserCerts = append(a.sshCAUserCerts, key.PublicKey())
+					a.sshCAUserCerts = append(a.sshCAUserCerts, publicKey)
 				}
 			default:
 				return errors.Errorf("unsupported type %s", key.Type)
 			}
 		}
-
-		// Configure template variables.
-		tmplVars.SSH.HostKey = a.sshCAHostCertSignKey.PublicKey()
-		tmplVars.SSH.UserKey = a.sshCAUserCertSignKey.PublicKey()
-		// On the templates we skip the first one because there's a distinction
-		// between the main key and federated keys.
-		tmplVars.SSH.HostFederatedKeys = append(tmplVars.SSH.HostFederatedKeys, a.sshCAHostFederatedCerts[1:]...)
-		tmplVars.SSH.UserFederatedKeys = append(tmplVars.SSH.UserFederatedKeys, a.sshCAUserFederatedCerts[1:]...)
 	}
 
-	// Check if a KMS with decryption capability is required and available
-	if a.requiresDecrypter() {
-		if _, ok := a.keyManager.(kmsapi.Decrypter); !ok {
-			return errors.New("keymanager doesn't provide crypto.Decrypter")
-		}
+	// Configure template variables. On the template variables HostFederatedKeys
+	// and UserFederatedKeys we will skip the actual CA that will be available
+	// in HostKey and UserKey.
+	//
+	// We cannot do it in the previous blocks because this configuration can be
+	// injected using options.
+	if a.sshCAHostCertSignKey != nil {
+		tmplVars.SSH.HostKey = a.sshCAHostCertSignKey.PublicKey()
+		tmplVars.SSH.HostFederatedKeys = append(tmplVars.SSH.HostFederatedKeys, a.sshCAHostFederatedCerts[1:]...)
+	} else {
+		tmplVars.SSH.HostFederatedKeys = append(tmplVars.SSH.HostFederatedKeys, a.sshCAHostFederatedCerts...)
+	}
+	if a.sshCAUserCertSignKey != nil {
+		tmplVars.SSH.UserKey = a.sshCAUserCertSignKey.PublicKey()
+		tmplVars.SSH.UserFederatedKeys = append(tmplVars.SSH.UserFederatedKeys, a.sshCAUserFederatedCerts[1:]...)
+	} else {
+		tmplVars.SSH.UserFederatedKeys = append(tmplVars.SSH.UserFederatedKeys, a.sshCAUserFederatedCerts...)
 	}
 
 	// Check if a KMS with decryption capability is required and available
@@ -412,9 +487,10 @@ func (a *Authority) init() error {
 		if err != nil {
 			return err
 		}
+		options.CertificateChain = append(options.CertificateChain, a.rootX509Certs...)
 		options.Signer, err = a.keyManager.CreateSigner(&kmsapi.CreateSignerRequest{
 			SigningKey: a.config.IntermediateKey,
-			Password:   []byte(a.config.Password),
+			Password:   []byte(a.password),
 		})
 		if err != nil {
 			return err
@@ -423,7 +499,7 @@ func (a *Authority) init() error {
 		if km, ok := a.keyManager.(kmsapi.Decrypter); ok {
 			options.Decrypter, err = km.CreateDecrypter(&kmsapi.CreateDecrypterRequest{
 				DecryptionKey: a.config.IntermediateKey,
-				Password:      []byte(a.config.Password),
+				Password:      []byte(a.password),
 			})
 			if err != nil {
 				return err
@@ -442,10 +518,13 @@ func (a *Authority) init() error {
 		// Initialize step-ca Admin Database if it's not already initialized using
 		// WithAdminDB.
 		if a.adminDB == nil {
-			// Check if AuthConfig already exists
-			a.adminDB, err = adminDBNosql.New(a.db.(nosql.DB), admin.DefaultAuthorityID)
-			if err != nil {
-				return err
+			if linkedcaClient != nil {
+				a.adminDB = linkedcaClient
+			} else {
+				a.adminDB, err = adminDBNosql.New(a.db.(nosql.DB), admin.DefaultAuthorityID)
+				if err != nil {
+					return err
+				}
 			}
 		}
 
@@ -453,9 +532,9 @@ func (a *Authority) init() error {
 		if err != nil {
 			return admin.WrapErrorISE(err, "error loading provisioners to initialize authority")
 		}
-		if len(provs) == 0 {
+		if len(provs) == 0 && !strings.EqualFold(a.config.AuthorityConfig.DeploymentType, "linked") {
 			// Create First Provisioner
-			prov, err := CreateFirstProvisioner(context.Background(), a.adminDB, a.config.Password)
+			prov, err := CreateFirstProvisioner(context.Background(), a.adminDB, string(a.password))
 			if err != nil {
 				return admin.WrapErrorISE(err, "error creating first provisioner")
 			}
@@ -508,6 +587,21 @@ func (a *Authority) GetAdminDatabase() admin.DB {
 	return a.adminDB
 }
 
+func (a *Authority) GetInfo() Info {
+	ai := Info{
+		StartTime:     a.startTime,
+		RootX509Certs: a.rootX509Certs,
+		DNSNames:      a.config.DNSNames,
+	}
+	if a.sshCAUserCertSignKey != nil {
+		ai.SSHCAUserPublicKey = ssh.MarshalAuthorizedKey(a.sshCAUserCertSignKey.PublicKey())
+	}
+	if a.sshCAHostCertSignKey != nil {
+		ai.SSHCAHostPublicKey = ssh.MarshalAuthorizedKey(a.sshCAHostCertSignKey.PublicKey())
+	}
+	return ai
+}
+
 // IsAdminAPIEnabled returns a boolean indicating whether the Admin API has
 // been enabled.
 func (a *Authority) IsAdminAPIEnabled() bool {
@@ -527,6 +621,22 @@ func (a *Authority) CloseForReload() {
 	if err := a.keyManager.Close(); err != nil {
 		log.Printf("error closing the key manager: %v", err)
 	}
+	if client, ok := a.adminDB.(*linkedCaClient); ok {
+		client.Stop()
+	}
+}
+
+// IsRevoked returns whether or not a certificate has been
+// revoked before.
+func (a *Authority) IsRevoked(sn string) (bool, error) {
+	// Check the passive revocation table.
+	if lca, ok := a.adminDB.(interface {
+		IsRevoked(string) (bool, error)
+	}); ok {
+		return lca.IsRevoked(sn)
+	}
+
+	return a.db.IsRevoked(sn)
 }
 
 // requiresDecrypter returns whether the Authority

@@ -6,6 +6,8 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -53,7 +55,7 @@ func (a *Authority) authorizeToken(ctx context.Context, token string) (provision
 	// key in order to verify the claims and we need the issuer from the claims
 	// before we can look up the provisioner.
 	var claims Claims
-	if err = tok.UnsafeClaimsWithoutVerification(&claims); err != nil {
+	if err := tok.UnsafeClaimsWithoutVerification(&claims); err != nil {
 		return nil, errs.Wrap(http.StatusUnauthorized, err, "authority.authorizeToken")
 	}
 
@@ -76,7 +78,7 @@ func (a *Authority) authorizeToken(ctx context.Context, token string) (provision
 	// Store the token to protect against reuse unless it's skipped.
 	// If we cannot get a token id from the provisioner, just hash the token.
 	if !SkipTokenReuseFromContext(ctx) {
-		if err = a.UseToken(token, p); err != nil {
+		if err := a.UseToken(token, p); err != nil {
 			return nil, err
 		}
 	}
@@ -111,7 +113,7 @@ func (a *Authority) AuthorizeAdminToken(r *http.Request, token string) (*linkedc
 	//      to the public certificate in the `x5c` header of the token.
 	//   2. Asserts that the claims are valid - have not been tampered with.
 	var claims jose.Claims
-	if err = jwt.Claims(leaf.PublicKey, &claims); err != nil {
+	if err := jwt.Claims(leaf.PublicKey, &claims); err != nil {
 		return nil, admin.WrapError(admin.ErrorUnauthorizedType, err, "adminHandler.authorizeToken; error parsing x5c claims")
 	}
 
@@ -121,29 +123,31 @@ func (a *Authority) AuthorizeAdminToken(r *http.Request, token string) (*linkedc
 	}
 
 	// Check that the token has not been used.
-	if err = a.UseToken(token, prov); err != nil {
+	if err := a.UseToken(token, prov); err != nil {
 		return nil, admin.WrapError(admin.ErrorUnauthorizedType, err, "adminHandler.authorizeToken; error with reuse token")
 	}
 
 	// According to "rfc7519 JSON Web Token" acceptable skew should be no
 	// more than a few minutes.
-	if err = claims.ValidateWithLeeway(jose.Expected{
-		Issuer: prov.GetName(),
-		Time:   time.Now().UTC(),
+	if err := claims.ValidateWithLeeway(jose.Expected{
+		Time: time.Now().UTC(),
 	}, time.Minute); err != nil {
 		return nil, admin.WrapError(admin.ErrorUnauthorizedType, err, "x5c.authorizeToken; invalid x5c claims")
 	}
 
 	// validate audience: path matches the current path
-	if r.URL.Path != claims.Audience[0] {
-		return nil, admin.NewError(admin.ErrorUnauthorizedType,
-			"x5c.authorizeToken; x5c token has invalid audience "+
-				"claim (aud); expected %s, but got %s", r.URL.Path, claims.Audience)
+	if !matchesAudience(claims.Audience, a.config.Audience(r.URL.Path)) {
+		return nil, admin.NewError(admin.ErrorUnauthorizedType, "x5c.authorizeToken; x5c token has invalid audience claim (aud)")
+	}
+
+	// validate issuer: old versions used the provisioner name, new version uses
+	// 'step-admin-client/1.0'
+	if claims.Issuer != "step-admin-client/1.0" && claims.Issuer != prov.GetName() {
+		return nil, admin.NewError(admin.ErrorUnauthorizedType, "x5c.authorizeToken; x5c token has invalid issuer claim (iss)")
 	}
 
 	if claims.Subject == "" {
-		return nil, admin.NewError(admin.ErrorUnauthorizedType,
-			"x5c.authorizeToken; x5c token subject cannot be empty")
+		return nil, admin.NewError(admin.ErrorUnauthorizedType, "x5c.authorizeToken; x5c token subject cannot be empty")
 	}
 
 	var (
@@ -154,7 +158,7 @@ func (a *Authority) AuthorizeAdminToken(r *http.Request, token string) (*linkedc
 	adminSANs := append([]string{leaf.Subject.CommonName}, leaf.DNSNames...)
 	adminSANs = append(adminSANs, leaf.EmailAddresses...)
 	for _, san := range adminSANs {
-		if adm, ok = a.LoadAdminBySubProv(san, claims.Issuer); ok {
+		if adm, ok = a.LoadAdminBySubProv(san, prov.GetName()); ok {
 			adminFound = true
 			break
 		}
@@ -261,7 +265,7 @@ func (a *Authority) authorizeRevoke(ctx context.Context, token string) error {
 	if err != nil {
 		return errs.Wrap(http.StatusInternalServerError, err, "authority.authorizeRevoke")
 	}
-	if err = p.AuthorizeRevoke(ctx, token); err != nil {
+	if err := p.AuthorizeRevoke(ctx, token); err != nil {
 		return errs.Wrap(http.StatusInternalServerError, err, "authority.authorizeRevoke")
 	}
 	return nil
@@ -273,23 +277,51 @@ func (a *Authority) authorizeRevoke(ctx context.Context, token string) error {
 //
 // TODO(mariano): should we authorize by default?
 func (a *Authority) authorizeRenew(cert *x509.Certificate) error {
-	var opts = []interface{}{errs.WithKeyVal("serialNumber", cert.SerialNumber.String())}
+	serial := cert.SerialNumber.String()
+	var opts = []interface{}{errs.WithKeyVal("serialNumber", serial)}
 
-	// Check the passive revocation table.
-	isRevoked, err := a.db.IsRevoked(cert.SerialNumber.String())
+	isRevoked, err := a.IsRevoked(serial)
 	if err != nil {
 		return errs.Wrap(http.StatusInternalServerError, err, "authority.authorizeRenew", opts...)
 	}
 	if isRevoked {
 		return errs.Unauthorized("authority.authorizeRenew: certificate has been revoked", opts...)
 	}
-
-	p, ok := a.provisioners.LoadByCertificate(cert)
-	if !ok {
-		return errs.Unauthorized("authority.authorizeRenew: provisioner not found", opts...)
+	p, err := a.LoadProvisionerByCertificate(cert)
+	if err != nil {
+		var ok bool
+		// For backward compatibility this method will also succeed if the
+		// certificate does not have a provisioner extension. LoadByCertificate
+		// returns the noop provisioner if this happens, and it allows
+		// certificate renewals.
+		if p, ok = a.provisioners.LoadByCertificate(cert); !ok {
+			return errs.Unauthorized("authority.authorizeRenew: provisioner not found", opts...)
+		}
 	}
 	if err := p.AuthorizeRenew(context.Background(), cert); err != nil {
 		return errs.Wrap(http.StatusInternalServerError, err, "authority.authorizeRenew", opts...)
+	}
+	return nil
+}
+
+// authorizeSSHCertificate returns an error if the given certificate is revoked.
+func (a *Authority) authorizeSSHCertificate(ctx context.Context, cert *ssh.Certificate) error {
+	var err error
+	var isRevoked bool
+
+	serial := strconv.FormatUint(cert.Serial, 10)
+	if lca, ok := a.adminDB.(interface {
+		IsSSHRevoked(string) (bool, error)
+	}); ok {
+		isRevoked, err = lca.IsSSHRevoked(serial)
+	} else {
+		isRevoked, err = a.db.IsSSHRevoked(serial)
+	}
+	if err != nil {
+		return errs.Wrap(http.StatusInternalServerError, err, "authority.authorizeSSHCertificate", errs.WithKeyVal("serialNumber", serial))
+	}
+	if isRevoked {
+		return errs.Unauthorized("authority.authorizeSSHCertificate: certificate has been revoked", errs.WithKeyVal("serialNumber", serial))
 	}
 	return nil
 }
@@ -348,4 +380,86 @@ func (a *Authority) authorizeSSHRevoke(ctx context.Context, token string) error 
 		return errs.Wrap(http.StatusInternalServerError, err, "authority.authorizeSSHRevoke")
 	}
 	return nil
+}
+
+// AuthorizeRenewToken validates the renew token and returns the leaf
+// certificate in the x5cInsecure header.
+func (a *Authority) AuthorizeRenewToken(ctx context.Context, ott string) (*x509.Certificate, error) {
+	var claims jose.Claims
+	jwt, chain, err := jose.ParseX5cInsecure(ott, a.rootX509Certs)
+	if err != nil {
+		return nil, errs.UnauthorizedErr(err, errs.WithMessage("error validating renew token"))
+	}
+	leaf := chain[0][0]
+	if err := jwt.Claims(leaf.PublicKey, &claims); err != nil {
+		return nil, errs.InternalServerErr(err, errs.WithMessage("error validating renew token"))
+	}
+
+	p, err := a.LoadProvisionerByCertificate(leaf)
+	if err != nil {
+		return nil, errs.Unauthorized("error validating renew token: cannot get provisioner from certificate")
+	}
+	if err := a.UseToken(ott, p); err != nil {
+		return nil, err
+	}
+
+	if err := claims.ValidateWithLeeway(jose.Expected{
+		Subject: leaf.Subject.CommonName,
+		Time:    time.Now().UTC(),
+	}, time.Minute); err != nil {
+		switch err {
+		case jose.ErrInvalidIssuer:
+			return nil, errs.UnauthorizedErr(err, errs.WithMessage("error validating renew token: invalid issuer claim (iss)"))
+		case jose.ErrInvalidSubject:
+			return nil, errs.UnauthorizedErr(err, errs.WithMessage("error validating renew token: invalid subject claim (sub)"))
+		case jose.ErrNotValidYet:
+			return nil, errs.UnauthorizedErr(err, errs.WithMessage("error validating renew token: token not valid yet (nbf)"))
+		case jose.ErrExpired:
+			return nil, errs.UnauthorizedErr(err, errs.WithMessage("error validating renew token: token is expired (exp)"))
+		case jose.ErrIssuedInTheFuture:
+			return nil, errs.UnauthorizedErr(err, errs.WithMessage("error validating renew token: token issued in the future (iat)"))
+		default:
+			return nil, errs.UnauthorizedErr(err, errs.WithMessage("error validating renew token"))
+		}
+	}
+
+	audiences := a.config.GetAudiences().Renew
+	if !matchesAudience(claims.Audience, audiences) {
+		return nil, errs.InternalServerErr(err, errs.WithMessage("error validating renew token: invalid audience claim (aud)"))
+	}
+
+	// validate issuer: old versions used the provisioner name, new version uses
+	// 'step-ca-client/1.0'
+	if claims.Issuer != "step-ca-client/1.0" && claims.Issuer != p.GetName() {
+		return nil, admin.NewError(admin.ErrorUnauthorizedType, "error validating renew token: invalid issuer claim (iss)")
+	}
+
+	return leaf, nil
+}
+
+// matchesAudience returns true if A and B share at least one element.
+func matchesAudience(as, bs []string) bool {
+	if len(bs) == 0 || len(as) == 0 {
+		return false
+	}
+
+	for _, b := range bs {
+		for _, a := range as {
+			if b == a || stripPort(a) == stripPort(b) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// stripPort attempts to strip the port from the given url. If parsing the url
+// produces errors it will just return the passed argument.
+func stripPort(rawurl string) string {
+	u, err := url.Parse(rawurl)
+	if err != nil {
+		return rawurl
+	}
+	u.Host = u.Hostname()
+	return u.String()
 }

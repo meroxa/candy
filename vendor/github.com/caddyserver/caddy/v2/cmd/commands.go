@@ -156,16 +156,19 @@ development environment.`,
 	RegisterCommand(Command{
 		Name:  "stop",
 		Func:  cmdStop,
+		Usage: "[--address <interface>] [--config <path> [--adapter <name>]]",
 		Short: "Gracefully stops a started Caddy process",
 		Long: `
 Stops the background Caddy process as gracefully as possible.
 
 It requires that the admin API is enabled and accessible, since it will
-use the API's /stop endpoint. The address of this request can be
-customized using the --address flag if it is not the default.`,
+use the API's /stop endpoint. The address of this request can be customized
+using the --address flag, or from the given --config, if not the default.`,
 		Flags: func() *flag.FlagSet {
 			fs := flag.NewFlagSet("stop", flag.ExitOnError)
 			fs.String("address", "", "The address to use to reach the admin API endpoint, if not the default")
+			fs.String("config", "", "Configuration file to use to parse the admin address, if --address is not used")
+			fs.String("adapter", "", "Name of config adapter to apply (when --config is used)")
 			return fs
 		}(),
 	})
@@ -208,6 +211,7 @@ config file; otherwise the default is assumed.`,
 			fs := flag.NewFlagSet("list-modules", flag.ExitOnError)
 			fs.Bool("packages", false, "Print package paths")
 			fs.Bool("versions", false, "Print version information")
+			fs.Bool("skip-standard", false, "Skip printing standard modules")
 			return fs
 		}(),
 	})
@@ -259,7 +263,7 @@ Loads and provisions the provided config, but does not start running it.
 This reveals any errors with the configuration through the loading and
 provisioning stages.`,
 		Flags: func() *flag.FlagSet {
-			fs := flag.NewFlagSet("load", flag.ExitOnError)
+			fs := flag.NewFlagSet("validate", flag.ExitOnError)
 			fs.String("config", "", "Input configuration file")
 			fs.String("adapter", "", "Name of config adapter")
 			return fs
@@ -278,12 +282,18 @@ human readability. It prints the result to stdout.
 If --overwrite is specified, the output will be written to the config file
 directly instead of printing it.
 
+If --diff is specified, the output will be compared against the input, and
+lines will be prefixed with '-' and '+' where they differ. Note that
+unchanged lines are prefixed with two spaces for alignment, and that this
+is not a valid patch format.
+
 If you wish you use stdin instead of a regular file, use - as the path.
 When reading from stdin, the --overwrite flag has no effect: the result
 is always printed to stdout.`,
 		Flags: func() *flag.FlagSet {
-			fs := flag.NewFlagSet("format", flag.ExitOnError)
+			fs := flag.NewFlagSet("fmt", flag.ExitOnError)
 			fs.Bool("overwrite", false, "Overwrite the input file with the results")
+			fs.Bool("diff", false, "Print the differences between the input file and the formatted output")
 			return fs
 		}(),
 	})
@@ -295,6 +305,11 @@ is always printed to stdout.`,
 		Long: `
 Downloads an updated Caddy binary with the same modules/plugins at the
 latest versions. EXPERIMENTAL: May be changed or removed.`,
+		Flags: func() *flag.FlagSet {
+			fs := flag.NewFlagSet("upgrade", flag.ExitOnError)
+			fs.Bool("keep-backup", false, "Keep the backed up binary, instead of deleting it")
+			return fs
+		}(),
 	})
 
 	RegisterCommand(Command{
@@ -307,6 +322,11 @@ Downloads an updated Caddy binary with the specified packages (module/plugin)
 added. Retains existing packages. Returns an error if the any of packages are 
 already included. EXPERIMENTAL: May be changed or removed.
 `,
+		Flags: func() *flag.FlagSet {
+			fs := flag.NewFlagSet("add-package", flag.ExitOnError)
+			fs.Bool("keep-backup", false, "Keep the backed up binary, instead of deleting it")
+			return fs
+		}(),
 	})
 
 	RegisterCommand(Command{
@@ -319,6 +339,11 @@ Downloads an updated Caddy binaries without the specified packages (module/plugi
 Returns an error if any of the packages are not included. 
 EXPERIMENTAL: May be changed or removed.
 `,
+		Flags: func() *flag.FlagSet {
+			fs := flag.NewFlagSet("remove-package", flag.ExitOnError)
+			fs.Bool("keep-backup", false, "Keep the backed up binary, instead of deleting it")
+			return fs
+		}(),
 	})
 
 }

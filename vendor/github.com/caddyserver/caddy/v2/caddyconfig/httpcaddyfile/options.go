@@ -29,11 +29,13 @@ func init() {
 	RegisterGlobalOption("debug", parseOptTrue)
 	RegisterGlobalOption("http_port", parseOptHTTPPort)
 	RegisterGlobalOption("https_port", parseOptHTTPSPort)
+	RegisterGlobalOption("default_bind", parseOptSingleString)
 	RegisterGlobalOption("grace_period", parseOptDuration)
 	RegisterGlobalOption("default_sni", parseOptSingleString)
 	RegisterGlobalOption("order", parseOptOrder)
 	RegisterGlobalOption("storage", parseOptStorage)
 	RegisterGlobalOption("storage_clean_interval", parseOptDuration)
+	RegisterGlobalOption("renew_interval", parseOptDuration)
 	RegisterGlobalOption("acme_ca", parseOptSingleString)
 	RegisterGlobalOption("acme_ca_root", parseOptSingleString)
 	RegisterGlobalOption("acme_dns", parseOptACMEDNS)
@@ -382,8 +384,8 @@ func parseOptAutoHTTPS(d *caddyfile.Dispenser, _ interface{}) (interface{}, erro
 	if d.Next() {
 		return "", d.ArgErr()
 	}
-	if val != "off" && val != "disable_redirects" && val != "ignore_loaded_certs" {
-		return "", d.Errf("auto_https must be one of 'off', 'disable_redirects' or 'ignore_loaded_certs'")
+	if val != "off" && val != "disable_redirects" && val != "disable_certs" && val != "ignore_loaded_certs" {
+		return "", d.Errf("auto_https must be one of 'off', 'disable_redirects', 'disable_certs', or 'ignore_loaded_certs'")
 	}
 	return val, nil
 }

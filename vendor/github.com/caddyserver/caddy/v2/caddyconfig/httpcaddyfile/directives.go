@@ -37,15 +37,20 @@ import (
 // The header directive goes second so that headers
 // can be manipulated before doing redirects.
 var directiveOrder = []string{
+	"tracing",
+
 	"map",
+	"vars",
 	"root",
 
 	"header",
+	"copy_response_headers", // only in reverse_proxy's handle_response
 	"request_body",
 
 	"redir",
 
-	// URI manipulation
+	// incoming request manipulation
+	"method",
 	"rewrite",
 	"uri",
 	"try_files",
@@ -65,6 +70,7 @@ var directiveOrder = []string{
 	// handlers that typically respond to requests
 	"abort",
 	"error",
+	"copy_response", // only in reverse_proxy's handle_response
 	"respond",
 	"metrics",
 	"reverse_proxy",
@@ -340,6 +346,9 @@ func parseSegmentAsConfig(h Helper) ([]ConfigValue, error) {
 			if err != nil {
 				return nil, h.Errf("parsing caddyfile tokens for '%s': %v", dir, err)
 			}
+
+			dir = normalizeDirectiveName(dir)
+
 			for _, result := range results {
 				result.directive = dir
 				allResults = append(allResults, result)
@@ -415,14 +424,29 @@ func sortRoutes(routes []ConfigValue) {
 			jPathLen = len(jPM[0])
 		}
 
-		// if both directives have no path matcher, use whichever one
-		// has any kind of matcher defined first.
-		if iPathLen == 0 && jPathLen == 0 {
-			return len(iRoute.MatcherSetsRaw) > 0 && len(jRoute.MatcherSetsRaw) == 0
-		}
+		// some directives involve setting values which can overwrite
+		// eachother, so it makes most sense to reverse the order so
+		// that the lease specific matcher is first; everything else
+		// has most-specific matcher first
+		if iDir == "vars" {
+			// if both directives have no path matcher, use whichever one
+			// has no matcher first.
+			if iPathLen == 0 && jPathLen == 0 {
+				return len(iRoute.MatcherSetsRaw) == 0 && len(jRoute.MatcherSetsRaw) > 0
+			}
 
-		// sort with the most-specific (longest) path first
-		return iPathLen > jPathLen
+			// sort with the least-specific (shortest) path first
+			return iPathLen < jPathLen
+		} else {
+			// if both directives have no path matcher, use whichever one
+			// has any kind of matcher defined first.
+			if iPathLen == 0 && jPathLen == 0 {
+				return len(iRoute.MatcherSetsRaw) > 0 && len(jRoute.MatcherSetsRaw) == 0
+			}
+
+			// sort with the most-specific (longest) path first
+			return iPathLen > jPathLen
+		}
 	})
 }
 
@@ -508,6 +532,17 @@ func (sb serverBlock) hasHostCatchAllKey() bool {
 		}
 	}
 	return false
+}
+
+// isAllHTTP returns true if all sb keys explicitly specify
+// the http:// scheme
+func (sb serverBlock) isAllHTTP() bool {
+	for _, addr := range sb.keys {
+		if addr.Scheme != "http" {
+			return false
+		}
+	}
+	return true
 }
 
 type (

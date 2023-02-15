@@ -176,7 +176,7 @@ Note that Let's Encrypt imposes [strict rate limits](https://letsencrypt.org/doc
 
 While developing your application and testing it, use [their staging endpoint](https://letsencrypt.org/docs/staging-environment/) which has much higher rate limits. Even then, don't hammer it: but it's much safer for when you're testing. When deploying, though, use their production CA because their staging CA doesn't issue trusted certificates.
 
-To use staging, set `certmagic.DefaultACME.CA = certmagic.LetsEncryptStagingCA` or set `CA` of every `ACMEManager` struct.
+To use staging, set `certmagic.DefaultACME.CA = certmagic.LetsEncryptStagingCA` or set `CA` of every `ACMEIssuer` struct.
 
 
 
@@ -256,7 +256,7 @@ magic := certmagic.New(cache, certmagic.Config{
 	// any customizations you need go here
 })
 
-myACME := certmagic.NewACMEManager(magic, certmagic.ACMEManager{
+myACME := certmagic.NewACMEIssuer(magic, certmagic.ACMEIssuer{
 	CA:     certmagic.LetsEncryptStagingCA,
 	Email:  "you@yours.com",
 	Agreed: true,
@@ -266,7 +266,7 @@ myACME := certmagic.NewACMEManager(magic, certmagic.ACMEManager{
 magic.Issuer = myACME
 
 // this obtains certificates or renews them if necessary
-err := magic.ManageSync([]string{"example.com", "sub.example.com"})
+err := magic.ManageSync(context.TODO(), []string{"example.com", "sub.example.com"})
 if err != nil {
 	return err
 }
@@ -274,6 +274,10 @@ if err != nil {
 // to use its certificates and solve the TLS-ALPN challenge,
 // you can get a TLS config to use in a TLS listener!
 tlsConfig := magic.TLSConfig()
+
+// be sure to customize NextProtos if serving a specific
+// application protocol after the TLS handshake, for example:
+tlsConfig.NextProtos = append([]string{"h2", "http/1.1"}, tlsConfig.NextProtos...)
 
 //// OR ////
 
@@ -340,7 +344,7 @@ If wrapping your handler is not a good solution, try this inside your `ServeHTTP
 
 ```go
 magic := certmagic.NewDefault()
-myACME := certmagic.NewACMEManager(magic, certmagic.DefaultACME)
+myACME := certmagic.NewACMEIssuer(magic, certmagic.DefaultACME)
 
 func ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if myACME.HandleHTTPChallenge(w, r) {
@@ -384,7 +388,7 @@ The DNS challenge is perhaps the most useful challenge because it allows you to 
 
 This challenge works by setting a special record in the domain's zone. To do this automatically, your DNS provider needs to offer an API by which changes can be made to domain names, and the changes need to take effect immediately for best results. CertMagic supports [all DNS providers with `libdns` implementations](https://github.com/libdns)! It always cleans up the temporary record after the challenge completes.
 
-To enable it, just set the `DNS01Solver` field on a `certmagic.ACMEManager` struct, or set the default `certmagic.ACMEManager.DNS01Solver` variable. For example, if my domains' DNS was served by Cloudflare:
+To enable it, just set the `DNS01Solver` field on a `certmagic.ACMEIssuer` struct, or set the default `certmagic.ACMEIssuer.DNS01Solver` variable. For example, if my domains' DNS was served by Cloudflare:
 
 ```go
 import "github.com/libdns/cloudflare"
@@ -396,7 +400,7 @@ certmagic.DefaultACME.DNS01Solver = &certmagic.DNS01Solver{
 }
 ```
 
-Now the DNS challenge will be used by default, and I can obtain certificates for wildcard domains, too. Enabling the DNS challenge disables the other challenges for that `certmagic.ACMEManager` instance.
+Now the DNS challenge will be used by default, and I can obtain certificates for wildcard domains, too. Enabling the DNS challenge disables the other challenges for that `certmagic.ACMEIssuer` instance.
 
 
 ## On-Demand TLS

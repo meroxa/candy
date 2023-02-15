@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/textproto"
 	"net/url"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -97,7 +98,8 @@ type (
 	// ```
 	MatchQuery url.Values
 
-	// MatchHeader matches requests by header fields. It performs fast,
+	// MatchHeader matches requests by header fields. The key is the field
+	// name and the array is the list of field values. It performs fast,
 	// exact string comparisons of the field values. Fast prefix, suffix,
 	// and substring matches can also be done by suffixing, prefixing, or
 	// surrounding the value with the wildcard `*` character, respectively.
@@ -114,7 +116,8 @@ type (
 	// (potentially leading to collisions).
 	MatchHeaderRE map[string]*MatchRegexp
 
-	// MatchProtocol matches requests by protocol.
+	// MatchProtocol matches requests by protocol. Recognized values are
+	// "http", "https", and "grpc".
 	MatchProtocol string
 
 	// MatchRemoteIP matches requests by client IP (or CIDR range).
@@ -128,7 +131,10 @@ type (
 		// to spoof request headers. Default: false
 		Forwarded bool `json:"forwarded,omitempty"`
 
+		// cidrs and zones vars should aligned always in the same
+		// length and indexes for matching later
 		cidrs  []*net.IPNet
+		zones  []string
 		logger *zap.Logger
 	}
 
@@ -139,9 +145,9 @@ type (
 	// matchers within a set work the same (i.e. different matchers in
 	// the same set are AND'ed).
 	//
-	// Note that the generated docs which describe the structure of
-	// this module are wrong because of how this type unmarshals JSON
-	// in a custom way. The correct structure is:
+	// NOTE: The generated docs which describe the structure of this
+	// module are wrong because of how this type unmarshals JSON in a
+	// custom way. The correct structure is:
 	//
 	// ```json
 	// [
@@ -312,7 +318,20 @@ func (m MatchPath) Provision(_ caddy.Context) error {
 
 // Match returns true if r matches m.
 func (m MatchPath) Match(r *http.Request) bool {
-	lowerPath := strings.ToLower(r.URL.Path)
+	// PathUnescape returns an error if the escapes aren't
+	// well-formed, meaning the count % matches the RFC.
+	// Return early if the escape is improper.
+	unescapedPath, err := url.PathUnescape(r.URL.Path)
+	if err != nil {
+		return false
+	}
+
+	lowerPath := strings.ToLower(unescapedPath)
+
+	// Clean the path, merges doubled slashes, etc.
+	// This ensures maliciously crafted requests can't bypass
+	// the path matcher. See #4407
+	lowerPath = path.Clean(lowerPath)
 
 	// see #2917; Windows ignores trailing dots and spaces
 	// when accessing files (sigh), potentially causing a
@@ -320,6 +339,11 @@ func (m MatchPath) Match(r *http.Request) bool {
 	// as static files, exposing the source code, instead of
 	// being matched by *.php to be treated as PHP scripts
 	lowerPath = strings.TrimRight(lowerPath, ". ")
+
+	// Cleaning may remove the trailing slash, but we want to keep it
+	if lowerPath != "/" && strings.HasSuffix(r.URL.Path, "/") {
+		lowerPath = lowerPath + "/"
+	}
 
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
@@ -394,7 +418,26 @@ func (MatchPathRE) CaddyModule() caddy.ModuleInfo {
 // Match returns true if r matches m.
 func (m MatchPathRE) Match(r *http.Request) bool {
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-	return m.MatchRegexp.Match(r.URL.Path, repl)
+
+	// PathUnescape returns an error if the escapes aren't
+	// well-formed, meaning the count % matches the RFC.
+	// Return early if the escape is improper.
+	unescapedPath, err := url.PathUnescape(r.URL.Path)
+	if err != nil {
+		return false
+	}
+
+	// Clean the path, merges doubled slashes, etc.
+	// This ensures maliciously crafted requests can't bypass
+	// the path matcher. See #4407
+	cleanedPath := path.Clean(unescapedPath)
+
+	// Cleaning may remove the trailing slash, but we want to keep it
+	if cleanedPath != "/" && strings.HasSuffix(r.URL.Path, "/") {
+		cleanedPath = cleanedPath + "/"
+	}
+
+	return m.MatchRegexp.Match(cleanedPath, repl)
 }
 
 // CaddyModule returns the Caddy module information.
@@ -837,10 +880,19 @@ func (m *MatchRemoteIP) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 func (m *MatchRemoteIP) Provision(ctx caddy.Context) error {
 	m.logger = ctx.Logger(m)
 	for _, str := range m.Ranges {
+		// Exclude the zone_id from the IP
+		if strings.Contains(str, "%") {
+			split := strings.Split(str, "%")
+			str = split[0]
+			// write zone identifiers in m.zones for matching later
+			m.zones = append(m.zones, split[1])
+		} else {
+			m.zones = append(m.zones, "")
+		}
 		if strings.Contains(str, "/") {
 			_, ipNet, err := net.ParseCIDR(str)
 			if err != nil {
-				return fmt.Errorf("parsing CIDR expression: %v", err)
+				return fmt.Errorf("parsing CIDR expression '%s': %v", str, err)
 			}
 			m.cidrs = append(m.cidrs, ipNet)
 		} else {
@@ -858,8 +910,9 @@ func (m *MatchRemoteIP) Provision(ctx caddy.Context) error {
 	return nil
 }
 
-func (m MatchRemoteIP) getClientIP(r *http.Request) (net.IP, error) {
+func (m MatchRemoteIP) getClientIP(r *http.Request) (net.IP, string, error) {
 	remote := r.RemoteAddr
+	zoneID := ""
 	if m.Forwarded {
 		if fwdFor := r.Header.Get("X-Forwarded-For"); fwdFor != "" {
 			remote = strings.TrimSpace(strings.Split(fwdFor, ",")[0])
@@ -869,24 +922,39 @@ func (m MatchRemoteIP) getClientIP(r *http.Request) (net.IP, error) {
 	if err != nil {
 		ipStr = remote // OK; probably didn't have a port
 	}
+	// Some IPv6-Adresses can contain zone identifiers at the end,
+	// which are separated with "%"
+	if strings.Contains(ipStr, "%") {
+		split := strings.Split(ipStr, "%")
+		ipStr = split[0]
+		zoneID = split[1]
+	}
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
-		return nil, fmt.Errorf("invalid client IP address: %s", ipStr)
+		return nil, zoneID, fmt.Errorf("invalid client IP address: %s", ipStr)
 	}
-	return ip, nil
+	return ip, zoneID, nil
 }
 
 // Match returns true if r matches m.
 func (m MatchRemoteIP) Match(r *http.Request) bool {
-	clientIP, err := m.getClientIP(r)
+	clientIP, zoneID, err := m.getClientIP(r)
 	if err != nil {
 		m.logger.Error("getting client IP", zap.Error(err))
 		return false
 	}
-	for _, ipRange := range m.cidrs {
+	zoneFilter := true
+	for i, ipRange := range m.cidrs {
 		if ipRange.Contains(clientIP) {
-			return true
+			// Check if there are zone filters assigned and if they match.
+			if m.zones[i] == "" || zoneID == m.zones[i] {
+				return true
+			}
+			zoneFilter = false
 		}
+	}
+	if !zoneFilter {
+		m.logger.Debug("zone ID from remote did not match", zap.String("zone", zoneID))
 	}
 	return false
 }
@@ -986,6 +1054,12 @@ func (mre *MatchRegexp) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 var wordRE = regexp.MustCompile(`\w+`)
 
 const regexpPlaceholderPrefix = "http.regexp"
+
+// MatcherErrorVarKey is the key used for the variable that
+// holds an optional error emitted from a request matcher,
+// to short-circuit the handler chain, since matchers cannot
+// return errors via the RequestMatcher interface.
+const MatcherErrorVarKey = "matchers.error"
 
 // Interface guards
 var (

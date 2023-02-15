@@ -44,6 +44,8 @@ func UnmarshalProvisionerDetails(typ linkedca.Provisioner_Type, data []byte) (*l
 		v.Data = new(linkedca.ProvisionerDetails_SSHPOP)
 	case linkedca.Provisioner_SCEP:
 		v.Data = new(linkedca.ProvisionerDetails_SCEP)
+	case linkedca.Provisioner_NEBULA:
+		v.Data = new(linkedca.ProvisionerDetails_Nebula)
 	default:
 		return nil, fmt.Errorf("unsupported provisioner type %s", typ)
 	}
@@ -54,7 +56,7 @@ func UnmarshalProvisionerDetails(typ linkedca.Provisioner_Type, data []byte) (*l
 	return &linkedca.ProvisionerDetails{Data: v.Data}, nil
 }
 
-// DB is the DB interface expected by the step-ca ACME API.
+// DB is the DB interface expected by the step-ca Admin API.
 type DB interface {
 	CreateProvisioner(ctx context.Context, prov *linkedca.Provisioner) error
 	GetProvisioner(ctx context.Context, id string) (*linkedca.Provisioner, error)

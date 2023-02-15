@@ -18,8 +18,8 @@ import (
 	"context"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"net/url"
+	"os"
 	"strconv"
 	"time"
 
@@ -36,20 +36,16 @@ func init() {
 	caddy.RegisterModule(ACMEIssuer{})
 }
 
-// ACMEIssuer makes an ACME manager
-// for managing certificates using ACME.
-//
-// TODO: support multiple ACME endpoints (probably
-// requires an array of these structs) - caddy would
-// also have to load certs from the backup CAs if the
-// first one is expired...
+// ACMEIssuer manages certificates using the ACME protocol (RFC 8555).
 type ACMEIssuer struct {
-	// The URL to the CA's ACME directory endpoint.
+	// The URL to the CA's ACME directory endpoint. Default:
+	// https://acme-v02.api.letsencrypt.org/directory
 	CA string `json:"ca,omitempty"`
 
 	// The URL to the test CA's ACME directory endpoint.
 	// This endpoint is only used during retries if there
-	// is a failure using the primary CA.
+	// is a failure using the primary CA. Default:
+	// https://acme-staging-v02.api.letsencrypt.org/directory
 	TestCA string `json:"test_ca,omitempty"`
 
 	// Your email address, so the CA can contact you if necessary.
@@ -71,6 +67,7 @@ type ACMEIssuer struct {
 	ExternalAccount *acme.EAB `json:"external_account,omitempty"`
 
 	// Time to wait before timing out an ACME operation.
+	// Default: 0 (no timeout)
 	ACMETimeout caddy.Duration `json:"acme_timeout,omitempty"`
 
 	// Configures the various ACME challenge types.
@@ -88,7 +85,7 @@ type ACMEIssuer struct {
 	PreferredChains *ChainPreference `json:"preferred_chains,omitempty"`
 
 	rootPool *x509.CertPool
-	template certmagic.ACMEManager
+	template certmagic.ACMEIssuer
 	magic    *certmagic.Config
 	logger   *zap.Logger
 }
@@ -145,8 +142,10 @@ func (iss *ACMEIssuer) Provision(ctx caddy.Context) error {
 			iss.Challenges.DNS.solver = &certmagic.DNS01Solver{
 				DNSProvider:        val.(certmagic.ACMEDNSProvider),
 				TTL:                time.Duration(iss.Challenges.DNS.TTL),
+				PropagationDelay:   time.Duration(iss.Challenges.DNS.PropagationDelay),
 				PropagationTimeout: time.Duration(iss.Challenges.DNS.PropagationTimeout),
 				Resolvers:          iss.Challenges.DNS.Resolvers,
+				OverrideDomain:     iss.Challenges.DNS.OverrideDomain,
 			}
 		}
 	}
@@ -155,7 +154,7 @@ func (iss *ACMEIssuer) Provision(ctx caddy.Context) error {
 	if len(iss.TrustedRootsPEMFiles) > 0 {
 		iss.rootPool = x509.NewCertPool()
 		for _, pemFile := range iss.TrustedRootsPEMFiles {
-			pemData, err := ioutil.ReadFile(pemFile)
+			pemData, err := os.ReadFile(pemFile)
 			if err != nil {
 				return fmt.Errorf("loading trusted root CA's PEM file: %s: %v", pemFile, err)
 			}
@@ -174,8 +173,8 @@ func (iss *ACMEIssuer) Provision(ctx caddy.Context) error {
 	return nil
 }
 
-func (iss *ACMEIssuer) makeIssuerTemplate() (certmagic.ACMEManager, error) {
-	template := certmagic.ACMEManager{
+func (iss *ACMEIssuer) makeIssuerTemplate() (certmagic.ACMEIssuer, error) {
+	template := certmagic.ACMEIssuer{
 		CA:                iss.CA,
 		TestCA:            iss.TestCA,
 		Email:             iss.Email,
@@ -226,22 +225,22 @@ func (iss *ACMEIssuer) SetConfig(cfg *certmagic.Config) {
 
 // PreCheck implements the certmagic.PreChecker interface.
 func (iss *ACMEIssuer) PreCheck(ctx context.Context, names []string, interactive bool) error {
-	return certmagic.NewACMEManager(iss.magic, iss.template).PreCheck(ctx, names, interactive)
+	return certmagic.NewACMEIssuer(iss.magic, iss.template).PreCheck(ctx, names, interactive)
 }
 
 // Issue obtains a certificate for the given csr.
 func (iss *ACMEIssuer) Issue(ctx context.Context, csr *x509.CertificateRequest) (*certmagic.IssuedCertificate, error) {
-	return certmagic.NewACMEManager(iss.magic, iss.template).Issue(ctx, csr)
+	return certmagic.NewACMEIssuer(iss.magic, iss.template).Issue(ctx, csr)
 }
 
 // IssuerKey returns the unique issuer key for the configured CA endpoint.
 func (iss *ACMEIssuer) IssuerKey() string {
-	return certmagic.NewACMEManager(iss.magic, iss.template).IssuerKey()
+	return certmagic.NewACMEIssuer(iss.magic, iss.template).IssuerKey()
 }
 
 // Revoke revokes the given certificate.
 func (iss *ACMEIssuer) Revoke(ctx context.Context, cert certmagic.CertificateResource, reason int) error {
-	return certmagic.NewACMEManager(iss.magic, iss.template).Revoke(ctx, cert, reason)
+	return certmagic.NewACMEIssuer(iss.magic, iss.template).Revoke(ctx, cert, reason)
 }
 
 // GetACMEIssuer returns iss. This is useful when other types embed ACMEIssuer, because
@@ -264,10 +263,13 @@ func (iss *ACMEIssuer) GetACMEIssuer() *ACMEIssuer { return iss }
 //         eab <key_id> <mac_key>
 //         trusted_roots <pem_files...>
 //         dns <provider_name> [<options>]
+//         propagation_delay <duration>
+//         propagation_timeout <duration>
 //         resolvers <dns_servers...>
+//         dns_challenge_override_domain <domain>
 //         preferred_chains [smallest] {
-//           root_common_name <common_names...>
-//           any_common_name  <common_names...>
+//             root_common_name <common_names...>
+//             any_common_name  <common_names...>
 //         }
 //     }
 //
@@ -391,14 +393,38 @@ func (iss *ACMEIssuer) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return err
 				}
 				iss.Challenges.DNS.ProviderRaw = caddyconfig.JSONModuleObject(unm, "name", provName, nil)
+
+			case "propagation_delay":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				delayStr := d.Val()
+				delay, err := caddy.ParseDuration(delayStr)
+				if err != nil {
+					return d.Errf("invalid propagation_delay duration %s: %v", delayStr, err)
+				}
+				if iss.Challenges == nil {
+					iss.Challenges = new(ChallengesConfig)
+				}
+				if iss.Challenges.DNS == nil {
+					iss.Challenges.DNS = new(DNSChallengeConfig)
+				}
+				iss.Challenges.DNS.PropagationDelay = caddy.Duration(delay)
+
 			case "propagation_timeout":
 				if !d.NextArg() {
 					return d.ArgErr()
 				}
 				timeoutStr := d.Val()
-				timeout, err := caddy.ParseDuration(timeoutStr)
-				if err != nil {
-					return d.Errf("invalid propagation_timeout duration %s: %v", timeoutStr, err)
+				var timeout time.Duration
+				if timeoutStr == "-1" {
+					timeout = time.Duration(-1)
+				} else {
+					var err error
+					timeout, err = caddy.ParseDuration(timeoutStr)
+					if err != nil {
+						return d.Errf("invalid propagation_timeout duration %s: %v", timeoutStr, err)
+					}
 				}
 				if iss.Challenges == nil {
 					iss.Challenges = new(ChallengesConfig)
@@ -419,6 +445,19 @@ func (iss *ACMEIssuer) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				if len(iss.Challenges.DNS.Resolvers) == 0 {
 					return d.ArgErr()
 				}
+
+			case "dns_challenge_override_domain":
+				arg := d.RemainingArgs()
+				if len(arg) != 1 {
+					return d.ArgErr()
+				}
+				if iss.Challenges == nil {
+					iss.Challenges = new(ChallengesConfig)
+				}
+				if iss.Challenges.DNS == nil {
+					iss.Challenges.DNS = new(DNSChallengeConfig)
+				}
+				iss.Challenges.DNS.OverrideDomain = arg[0]
 
 			case "preferred_chains":
 				chainPref, err := ParseCaddyfilePreferredChainsOptions(d)

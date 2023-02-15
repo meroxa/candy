@@ -26,23 +26,27 @@ var (
 	DefaultBackdate = time.Minute
 	// DefaultDisableRenewal disables renewals per provisioner.
 	DefaultDisableRenewal = false
+	// DefaultAllowRenewalAfterExpiry allows renewals even if the certificate is
+	// expired.
+	DefaultAllowRenewalAfterExpiry = false
 	// DefaultEnableSSHCA enable SSH CA features per provisioner or globally
 	// for all provisioners.
 	DefaultEnableSSHCA = false
 	// GlobalProvisionerClaims default claims for the Authority. Can be overridden
 	// by provisioner specific claims.
 	GlobalProvisionerClaims = provisioner.Claims{
-		MinTLSDur:         &provisioner.Duration{Duration: 5 * time.Minute}, // TLS certs
-		MaxTLSDur:         &provisioner.Duration{Duration: 24 * time.Hour},
-		DefaultTLSDur:     &provisioner.Duration{Duration: 24 * time.Hour},
-		DisableRenewal:    &DefaultDisableRenewal,
-		MinUserSSHDur:     &provisioner.Duration{Duration: 5 * time.Minute}, // User SSH certs
-		MaxUserSSHDur:     &provisioner.Duration{Duration: 24 * time.Hour},
-		DefaultUserSSHDur: &provisioner.Duration{Duration: 16 * time.Hour},
-		MinHostSSHDur:     &provisioner.Duration{Duration: 5 * time.Minute}, // Host SSH certs
-		MaxHostSSHDur:     &provisioner.Duration{Duration: 30 * 24 * time.Hour},
-		DefaultHostSSHDur: &provisioner.Duration{Duration: 30 * 24 * time.Hour},
-		EnableSSHCA:       &DefaultEnableSSHCA,
+		MinTLSDur:               &provisioner.Duration{Duration: 5 * time.Minute}, // TLS certs
+		MaxTLSDur:               &provisioner.Duration{Duration: 24 * time.Hour},
+		DefaultTLSDur:           &provisioner.Duration{Duration: 24 * time.Hour},
+		MinUserSSHDur:           &provisioner.Duration{Duration: 5 * time.Minute}, // User SSH certs
+		MaxUserSSHDur:           &provisioner.Duration{Duration: 24 * time.Hour},
+		DefaultUserSSHDur:       &provisioner.Duration{Duration: 16 * time.Hour},
+		MinHostSSHDur:           &provisioner.Duration{Duration: 5 * time.Minute}, // Host SSH certs
+		MaxHostSSHDur:           &provisioner.Duration{Duration: 30 * 24 * time.Hour},
+		DefaultHostSSHDur:       &provisioner.Duration{Duration: 30 * 24 * time.Hour},
+		EnableSSHCA:             &DefaultEnableSSHCA,
+		DisableRenewal:          &DefaultDisableRenewal,
+		AllowRenewalAfterExpiry: &DefaultAllowRenewalAfterExpiry,
 	}
 )
 
@@ -64,6 +68,7 @@ type Config struct {
 	TLS              *TLSOptions          `json:"tls,omitempty"`
 	Password         string               `json:"password,omitempty"`
 	Templates        *templates.Templates `json:"templates,omitempty"`
+	CommonName       string               `json:"commonName,omitempty"`
 }
 
 // ASN1DN contains ASN1.DN attributes that are used in Subject and Issuer
@@ -75,6 +80,7 @@ type ASN1DN struct {
 	Locality           string `json:"locality,omitempty"`
 	Province           string `json:"province,omitempty"`
 	StreetAddress      string `json:"streetAddress,omitempty"`
+	SerialNumber       string `json:"serialNumber,omitempty"`
 	CommonName         string `json:"commonName,omitempty"`
 }
 
@@ -83,8 +89,9 @@ type ASN1DN struct {
 // cas.Options.
 type AuthConfig struct {
 	*cas.Options
-	AuthorityID          string                `json:"authorityID,omitempty"`
-	Provisioners         provisioner.List      `json:"provisioners"`
+	AuthorityID          string                `json:"authorityId,omitempty"`
+	DeploymentType       string                `json:"deploymentType,omitempty"`
+	Provisioners         provisioner.List      `json:"provisioners,omitempty"`
 	Admins               []*linkedca.Admin     `json:"-"`
 	Template             *ASN1DN               `json:"template,omitempty"`
 	Claims               *provisioner.Claims   `json:"claims,omitempty"`
@@ -167,6 +174,9 @@ func (c *Config) Init() {
 	if c.AuthorityConfig == nil {
 		c.AuthorityConfig = &AuthConfig{}
 	}
+	if c.CommonName == "" {
+		c.CommonName = "Step Online CA"
+	}
 	c.AuthorityConfig.init()
 }
 
@@ -188,9 +198,10 @@ func (c *Config) Validate() error {
 	switch {
 	case c.Address == "":
 		return errors.New("address cannot be empty")
-
 	case len(c.DNSNames) == 0:
 		return errors.New("dnsNames cannot be empty")
+	case c.AuthorityConfig == nil:
+		return errors.New("authority cannot be nil")
 	}
 
 	// Options holds the RA/CAS configuration.
@@ -222,7 +233,7 @@ func (c *Config) Validate() error {
 			c.TLS.MaxVersion = DefaultTLSOptions.MaxVersion
 		}
 		if c.TLS.MinVersion == 0 {
-			c.TLS.MinVersion = c.TLS.MaxVersion
+			c.TLS.MinVersion = DefaultTLSOptions.MinVersion
 		}
 		if c.TLS.MinVersion > c.TLS.MaxVersion {
 			return errors.New("tls minVersion cannot exceed tls maxVersion")
@@ -266,29 +277,53 @@ func (c *Config) GetAudiences() provisioner.Audiences {
 	}
 
 	for _, name := range c.DNSNames {
+		hostname := toHostname(name)
 		audiences.Sign = append(audiences.Sign,
-			fmt.Sprintf("https://%s/1.0/sign", name),
-			fmt.Sprintf("https://%s/sign", name),
-			fmt.Sprintf("https://%s/1.0/ssh/sign", name),
-			fmt.Sprintf("https://%s/ssh/sign", name))
+			fmt.Sprintf("https://%s/1.0/sign", hostname),
+			fmt.Sprintf("https://%s/sign", hostname),
+			fmt.Sprintf("https://%s/1.0/ssh/sign", hostname),
+			fmt.Sprintf("https://%s/ssh/sign", hostname))
+		audiences.Renew = append(audiences.Renew,
+			fmt.Sprintf("https://%s/1.0/renew", hostname),
+			fmt.Sprintf("https://%s/renew", hostname))
 		audiences.Revoke = append(audiences.Revoke,
-			fmt.Sprintf("https://%s/1.0/revoke", name),
-			fmt.Sprintf("https://%s/revoke", name))
+			fmt.Sprintf("https://%s/1.0/revoke", hostname),
+			fmt.Sprintf("https://%s/revoke", hostname))
 		audiences.SSHSign = append(audiences.SSHSign,
-			fmt.Sprintf("https://%s/1.0/ssh/sign", name),
-			fmt.Sprintf("https://%s/ssh/sign", name),
-			fmt.Sprintf("https://%s/1.0/sign", name),
-			fmt.Sprintf("https://%s/sign", name))
+			fmt.Sprintf("https://%s/1.0/ssh/sign", hostname),
+			fmt.Sprintf("https://%s/ssh/sign", hostname),
+			fmt.Sprintf("https://%s/1.0/sign", hostname),
+			fmt.Sprintf("https://%s/sign", hostname))
 		audiences.SSHRevoke = append(audiences.SSHRevoke,
-			fmt.Sprintf("https://%s/1.0/ssh/revoke", name),
-			fmt.Sprintf("https://%s/ssh/revoke", name))
+			fmt.Sprintf("https://%s/1.0/ssh/revoke", hostname),
+			fmt.Sprintf("https://%s/ssh/revoke", hostname))
 		audiences.SSHRenew = append(audiences.SSHRenew,
-			fmt.Sprintf("https://%s/1.0/ssh/renew", name),
-			fmt.Sprintf("https://%s/ssh/renew", name))
+			fmt.Sprintf("https://%s/1.0/ssh/renew", hostname),
+			fmt.Sprintf("https://%s/ssh/renew", hostname))
 		audiences.SSHRekey = append(audiences.SSHRekey,
-			fmt.Sprintf("https://%s/1.0/ssh/rekey", name),
-			fmt.Sprintf("https://%s/ssh/rekey", name))
+			fmt.Sprintf("https://%s/1.0/ssh/rekey", hostname),
+			fmt.Sprintf("https://%s/ssh/rekey", hostname))
 	}
 
 	return audiences
+}
+
+// Audience returns the list of audiences for a given path.
+func (c *Config) Audience(path string) []string {
+	audiences := make([]string, len(c.DNSNames)+1)
+	for i, name := range c.DNSNames {
+		hostname := toHostname(name)
+		audiences[i] = "https://" + hostname + path
+	}
+	// For backward compatibility
+	audiences[len(c.DNSNames)] = path
+	return audiences
+}
+
+func toHostname(name string) string {
+	// ensure an IPv6 address is represented with square brackets when used as hostname
+	if ip := net.ParseIP(name); ip != nil && ip.To4() == nil {
+		name = "[" + name + "]"
+	}
+	return name
 }

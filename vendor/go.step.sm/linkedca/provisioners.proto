@@ -5,6 +5,7 @@ package linkedca;
 option go_package = "go.step.sm/linkedca";
 
 import "google/protobuf/timestamp.proto";
+import "policy.proto";
 
 message Provisioner {
 	enum Type {
@@ -19,6 +20,7 @@ message Provisioner {
 		K8SSA = 8;
 		SSHPOP = 9;
 		SCEP = 10;
+		NEBULA = 11;
 	}
 	string id = 1;
 	string authority_id = 2;
@@ -30,6 +32,13 @@ message Provisioner {
 	Template ssh_template = 8;
 	google.protobuf.Timestamp created_at = 9;
 	google.protobuf.Timestamp deleted_at = 10;
+	Policy policy = 11;
+}
+
+message ProvisionerIdentity {
+	string id = 1;
+	Provisioner.Type type = 2;
+	string name = 3;
 }
 
 message ProvisionerDetails {
@@ -44,6 +53,7 @@ message ProvisionerDetails {
 		K8sSAProvisioner K8sSA = 27;
 		SSHPOPProvisioner SSHPOP = 28;
 		SCEPProvisioner SCEP = 29;
+		NebulaProvisioner Nebula = 30;
 	}
 }
 
@@ -55,6 +65,7 @@ message Claims {
 	X509Claims x509 = 1;
 	SSHClaims ssh = 2;
 	bool disable_renewal = 3;
+	bool allow_renewal_after_expiry = 4;
 }
 
 message X509Claims {
@@ -116,10 +127,13 @@ message AzureProvisioner {
 	string audience = 3;
 	bool disable_custom_sans = 4;
 	bool disable_trust_on_first_use = 5;
+	repeated string subscription_ids = 6;
+	repeated string object_ids = 7;
 }
 
 message ACMEProvisioner {
 	bool force_cn = 1;
+	bool require_eab = 2;
 }
 
 message X5CProvisioner {
@@ -137,4 +151,10 @@ message SCEPProvisioner {
 	string challenge = 2;
 	repeated string capabilities = 3;
 	int32 minimum_public_key_length = 4;
+	bool include_root = 5;
+	int32 encryption_algorithm_identifier = 6;
+}
+
+message NebulaProvisioner {
+	repeated bytes roots = 1;
 }

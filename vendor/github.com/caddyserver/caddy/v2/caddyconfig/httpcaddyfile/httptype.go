@@ -17,7 +17,6 @@ package httpcaddyfile
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"reflect"
 	"regexp"
 	"sort"
@@ -30,6 +29,7 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddypki"
 	"github.com/caddyserver/caddy/v2/modules/caddytls"
+	"go.uber.org/zap"
 )
 
 func init() {
@@ -113,6 +113,7 @@ func (st ServerType) Setup(inputServerBlocks []caddyfile.ServerBlock,
 		"{tls_client_serial}", "{http.request.tls.client.serial}",
 		"{tls_client_subject}", "{http.request.tls.client.subject}",
 		"{tls_client_certificate_pem}", "{http.request.tls.client.certificate_pem}",
+		"{tls_client_certificate_der_base64}", "{http.request.tls.client.certificate_der_base64}",
 		"{upstream_hostport}", "{http.reverse_proxy.upstream.hostport}",
 	)
 
@@ -128,6 +129,7 @@ func (st ServerType) Setup(inputServerBlocks []caddyfile.ServerBlock,
 		{regexp.MustCompile(`{header\.([\w-]*)}`), "{http.request.header.$1}"},
 		{regexp.MustCompile(`{path\.([\w-]*)}`), "{http.request.uri.path.$1}"},
 		{regexp.MustCompile(`{re\.([\w-]*)\.([\w-]*)}`), "{http.regexp.$1.$2}"},
+		{regexp.MustCompile(`{vars\.([\w-]*)}`), "{http.vars.$1}"},
 	}
 
 	for _, sb := range originalServerBlocks {
@@ -192,13 +194,7 @@ func (st ServerType) Setup(inputServerBlocks []caddyfile.ServerBlock,
 				return nil, warnings, fmt.Errorf("parsing caddyfile tokens for '%s': %v", dir, err)
 			}
 
-			// As a special case, we want "handle_path" to be sorted
-			// at the same level as "handle", so we force them to use
-			// the same directive name after their parsing is complete.
-			// See https://github.com/caddyserver/caddy/issues/3675#issuecomment-678042377
-			if dir == "handle_path" {
-				dir = "handle"
-			}
+			dir = normalizeDirectiveName(dir)
 
 			for _, result := range results {
 				result.directive = dir
@@ -451,14 +447,26 @@ func (st *ServerType) serversFromPairings(
 		// handle the auto_https global option
 		if autoHTTPS != "on" {
 			srv.AutoHTTPS = new(caddyhttp.AutoHTTPSConfig)
-			if autoHTTPS == "off" {
+			switch autoHTTPS {
+			case "off":
 				srv.AutoHTTPS.Disabled = true
-			}
-			if autoHTTPS == "disable_redirects" {
+			case "disable_redirects":
 				srv.AutoHTTPS.DisableRedir = true
-			}
-			if autoHTTPS == "ignore_loaded_certs" {
+			case "disable_certs":
+				srv.AutoHTTPS.DisableCerts = true
+			case "ignore_loaded_certs":
 				srv.AutoHTTPS.IgnoreLoadedCerts = true
+			}
+		}
+
+		// Using paths in site addresses is deprecated
+		// See ParseAddress() where parsing should later reject paths
+		// See https://github.com/caddyserver/caddy/pull/4728 for a full explanation
+		for _, sblock := range p.serverBlocks {
+			for _, addr := range sblock.keys {
+				if addr.Path != "" {
+					caddy.Log().Named("caddyfile").Warn("Using a path in a site address is deprecated; please use the 'handle' directive instead", zap.String("address", addr.String()))
+				}
 			}
 		}
 
@@ -549,7 +557,7 @@ func (st *ServerType) serversFromPairings(
 			// emit warnings if user put unspecified IP addresses; they probably want the bind directive
 			for _, h := range hosts {
 				if h == "0.0.0.0" || h == "::" {
-					log.Printf("[WARNING] Site block has unspecified IP address %s which only matches requests having that Host header; you probably want the 'bind' directive to configure the socket", h)
+					caddy.Log().Named("caddyfile").Warn("Site block has an unspecified IP address which only matches requests having that Host header; you probably want the 'bind' directive to configure the socket", zap.String("address", h))
 				}
 			}
 
@@ -585,7 +593,7 @@ func (st *ServerType) serversFromPairings(
 			}
 
 			for _, addr := range sblock.keys {
-				// if server only uses HTTPS port, auto-HTTPS will not apply
+				// if server only uses HTTP port, auto-HTTPS will not apply
 				if listenersUseAnyPortOtherThan(srv.Listen, httpPort) {
 					// exclude any hosts that were defined explicitly with "http://"
 					// in the key from automated cert management (issue #2998)
@@ -1058,6 +1066,19 @@ func buildSubroute(routes []ConfigValue, groupCounter counter) (*caddyhttp.Subro
 	subroute.Routes = consolidateRoutes(subroute.Routes)
 
 	return subroute, nil
+}
+
+// normalizeDirectiveName ensures directives that should be sorted
+// at the same level are named the same before sorting happens.
+func normalizeDirectiveName(directive string) string {
+	// As a special case, we want "handle_path" to be sorted
+	// at the same level as "handle", so we force them to use
+	// the same directive name after their parsing is complete.
+	// See https://github.com/caddyserver/caddy/issues/3675#issuecomment-678042377
+	if directive == "handle_path" {
+		directive = "handle"
+	}
+	return directive
 }
 
 // consolidateRoutes combines routes with the same properties

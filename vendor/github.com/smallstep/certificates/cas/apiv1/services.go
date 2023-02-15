@@ -1,6 +1,7 @@
 package apiv1
 
 import (
+	"crypto/x509"
 	"net/http"
 	"strings"
 )
@@ -26,6 +27,12 @@ type CertificateAuthorityCreator interface {
 	CreateCertificateAuthority(req *CreateCertificateAuthorityRequest) (*CreateCertificateAuthorityResponse, error)
 }
 
+// SignatureAlgorithmGetter is an optional implementation in a crypto.Signer
+// that returns the SignatureAlgorithm to use.
+type SignatureAlgorithmGetter interface {
+	SignatureAlgorithm() x509.SignatureAlgorithm
+}
+
 // Type represents the CAS type used.
 type Type string
 
@@ -38,6 +45,8 @@ const (
 	CloudCAS = "cloudcas"
 	// StepCAS is a CertificateAuthorityService using another step-ca instance.
 	StepCAS = "stepcas"
+	// VaultCAS is a CertificateAuthorityService using Hasicorp Vault PKI.
+	VaultCAS = "vaultcas"
 )
 
 // String returns a string from the type. It will always return the lower case

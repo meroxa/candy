@@ -213,7 +213,11 @@ func (st *ServerType) listenerAddrsForServerBlockKey(sblock serverBlock, key str
 		lnHosts = append(lnHosts, cfgVal.Value.([]string)...)
 	}
 	if len(lnHosts) == 0 {
-		lnHosts = []string{""}
+		if defaultBind, ok := options["default_bind"].(string); ok {
+			lnHosts = []string{defaultBind}
+		} else {
+			lnHosts = []string{""}
+		}
 	}
 
 	// use a map to prevent duplication
@@ -223,7 +227,7 @@ func (st *ServerType) listenerAddrsForServerBlockKey(sblock serverBlock, key str
 		if err == nil && addr.IsUnixNetwork() {
 			listeners[host] = struct{}{}
 		} else {
-			listeners[net.JoinHostPort(host, lnPort)] = struct{}{}
+			listeners[host+":"+lnPort] = struct{}{}
 		}
 	}
 
@@ -337,7 +341,9 @@ func (a Address) Normalize() Address {
 	// ensure host is normalized if it's an IP address
 	host := strings.TrimSpace(a.Host)
 	if ip := net.ParseIP(host); ip != nil {
-		host = ip.String()
+		if ipv6 := ip.To16(); ipv6 != nil && ipv6.DefaultMask() == nil {
+			host = ipv6.String()
+		}
 	}
 
 	return Address{
@@ -347,28 +353,6 @@ func (a Address) Normalize() Address {
 		Port:     a.Port,
 		Path:     path,
 	}
-}
-
-// Key returns a string form of a, much like String() does, but this
-// method doesn't add anything default that wasn't in the original.
-func (a Address) Key() string {
-	res := ""
-	if a.Scheme != "" {
-		res += a.Scheme + "://"
-	}
-	if a.Host != "" {
-		res += a.Host
-	}
-	// insert port only if the original has its own explicit port
-	if a.Port != "" &&
-		len(a.Original) >= len(res) &&
-		strings.HasPrefix(a.Original[len(res):], ":"+a.Port) {
-		res += ":" + a.Port
-	}
-	if a.Path != "" {
-		res += a.Path
-	}
-	return res
 }
 
 // lowerExceptPlaceholders lowercases s except within

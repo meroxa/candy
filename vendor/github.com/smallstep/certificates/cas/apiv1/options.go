@@ -3,6 +3,7 @@ package apiv1
 import (
 	"crypto"
 	"crypto/x509"
+	"encoding/json"
 
 	"github.com/pkg/errors"
 	"github.com/smallstep/certificates/kms"
@@ -15,8 +16,9 @@ type Options struct {
 	Type string `json:"type"`
 
 	// CertificateAuthority reference:
-	// In StepCAS the value is the CA url, e.g. "https://ca.smallstep.com:9000".
+	// In StepCAS the value is the CA url, e.g., "https://ca.smallstep.com:9000".
 	// In CloudCAS the format is "projects/*/locations/*/certificateAuthorities/*".
+	// In VaultCAS the value is the url, e.g., "https://vault.smallstep.com".
 	CertificateAuthority string `json:"certificateAuthority,omitempty"`
 
 	// CertificateAuthorityFingerprint is the root fingerprint used to
@@ -31,16 +33,31 @@ type Options struct {
 	// https://cloud.google.com/docs/authentication.
 	CredentialsFile string `json:"credentialsFile,omitempty"`
 
-	// Certificate and signer are the issuer certificate, along with any other
-	// bundled certificates to be returned in the chain for consumers, and
-	// signer used in SoftCAS. They are configured in ca.json crt and key
-	// properties.
+	// CertificateChain contains the issuer certificate, along with any other
+	// bundled certificates to be returned in the chain to consumers. It is used
+	// used in SoftCAS and it is configured in the crt property of the ca.json.
 	CertificateChain []*x509.Certificate `json:"-"`
-	Signer           crypto.Signer       `json:"-"`
 
-	// IsCreator is set to true when we're creating a certificate authority. Is
-	// used to skip some validations when initializing a CertificateAuthority.
+	// Signer is the private key or a KMS signer for the issuer certificate. It
+	// is used in SoftCAS and it is configured in the key property of the
+	// ca.json.
+	Signer crypto.Signer `json:"-"`
+
+	// CertificateSigner combines CertificateChain and Signer in a callback that
+	// returns the chain of certificate and signer used to sign X.509
+	// certificates in SoftCAS.
+	CertificateSigner func() ([]*x509.Certificate, crypto.Signer, error) `json:"-"`
+
+	// IsCreator is set to true when we're creating a certificate authority. It
+	// is used to skip some validations when initializing a
+	// CertificateAuthority. This option is used on SoftCAS and CloudCAS.
 	IsCreator bool `json:"-"`
+
+	// IsCAGetter is set to true when we're just using the
+	// CertificateAuthorityGetter interface to retrieve the root certificate. It
+	// is used to skip some validations when initializing a
+	// CertificateAuthority. This option is used on StepCAS.
+	IsCAGetter bool `json:"-"`
 
 	// KeyManager is the KMS used to generate keys in SoftCAS.
 	KeyManager kms.KeyManager `json:"-"`
@@ -54,6 +71,9 @@ type Options struct {
 	CaPool     string `json:"-"`
 	CaPoolTier string `json:"-"`
 	GCSBucket  string `json:"-"`
+
+	// Generic structure to configure any CAS
+	Config json.RawMessage `json:"config,omitempty"`
 }
 
 // CertificateIssuer contains the properties used to use the StepCAS certificate
