@@ -1,6 +1,7 @@
 name: CI
 on:
   push:
+
 jobs:
   build:
     name: Compile
@@ -10,12 +11,12 @@ jobs:
         os: [macos-latest, ubuntu-latest]
     steps:
       - name: Set up Go 1.x
-        uses: actions/setup-go@v2
+        uses: actions/setup-go@v4
         with:
           go-version: ^1.17
         id: go
       - name: Check out code into the Go module directory
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
       - name: Compile
         run: make install
   test:
@@ -26,12 +27,12 @@ jobs:
         os: [macos-latest, ubuntu-latest]
     steps:
       - name: Set up Go 1.x
-        uses: actions/setup-go@v2
+        uses: actions/setup-go@v4
         with:
           go-version: ^1.17
         id: go
       - name: Check out code into the Go module directory
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
       - name: Test
         run: make test
   vet:
@@ -42,7 +43,7 @@ jobs:
         os: [macos-latest, ubuntu-latest]
     steps:
       - name: Check out code into the Go module directory
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v2
         with:
